@@ -1,8 +1,40 @@
 import { DomainError, invariant } from '../errors.ts';
 import type { TelemetryEvent } from '../types.ts';
 
-function eventFingerprint(event: TelemetryEvent): string {
-  return JSON.stringify([event.runId, event.eventId, event.sampleTimeMs, event.sequence, event.sensor, event.value, event.unit, event.channel ?? '']);
+type EventContent = Pick<TelemetryEvent, 'sampleTimeMs' | 'sequence' | 'sensor' | 'value' | 'unit'> & {
+  quality: TelemetryEvent['quality'] | null;
+  channel: string | null;
+};
+
+type EventReport = {
+  index: number;
+  event: TelemetryEvent;
+};
+
+type EventContentGroup = {
+  fingerprint: string;
+  content: EventContent;
+  reports: EventReport[];
+};
+
+type EventIdGroup = {
+  byContent: Map<string, EventContentGroup>;
+};
+
+function eventContent(event: TelemetryEvent): EventContent {
+  return {
+    sampleTimeMs: event.sampleTimeMs,
+    sequence: event.sequence,
+    sensor: event.sensor,
+    value: event.value,
+    unit: event.unit,
+    quality: event.quality ?? null,
+    channel: event.channel ?? null,
+  };
+}
+
+function contentFingerprint(event: TelemetryEvent): string {
+  return JSON.stringify(eventContent(event));
 }
 
 export function validateTelemetry(events: TelemetryEvent[]): void {
@@ -18,26 +50,88 @@ export function validateTelemetry(events: TelemetryEvent[]): void {
   }
 }
 
-export function replayTelemetry(input: TelemetryEvent[]): TelemetryEvent[] {
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareByPhysicalTime(a: TelemetryEvent, b: TelemetryEvent): number {
+  return a.sampleTimeMs - b.sampleTimeMs
+    || a.sequence - b.sequence
+    || compareStrings(a.eventId, b.eventId);
+}
+
+function canonicalizeTelemetry(input: TelemetryEvent[]): TelemetryEvent[] {
   validateTelemetry(input);
   const runIds = new Set(input.map((event) => event.runId));
-  invariant(runIds.size === 1, 'MIXED_RUNS', 'A replay batch must contain one test run', { runIds: [...runIds] });
-  const byStream = new Map<string, TelemetryEvent>();
-  for (const event of [...input].sort((a, b) => a.receivedTimeMs - b.receivedTimeMs || a.sequence - b.sequence)) {
-    const streamKey = `${event.eventId}:${event.sensor}:${event.channel ?? ''}`;
-    const previous = byStream.get(streamKey);
-    if (previous && eventFingerprint(previous) !== eventFingerprint(event)) {
-      byStream.set(streamKey, event);
-      continue;
-    }
-    if (!previous || event.receivedTimeMs >= previous.receivedTimeMs) byStream.set(streamKey, event);
+  invariant(input.length === 0 || runIds.size === 1, 'MIXED_RUNS', 'A replay batch must contain one test run', { runIds: [...runIds] });
+
+  const byEventId = new Map<string, EventIdGroup>();
+  for (const [index, event] of input.entries()) {
+    const group = byEventId.get(event.eventId) ?? { byContent: new Map<string, EventContentGroup>() };
+    const fingerprint = contentFingerprint(event);
+    const contentGroup = group.byContent.get(fingerprint) ?? { fingerprint, content: eventContent(event), reports: [] };
+    contentGroup.reports.push({ index, event });
+    group.byContent.set(fingerprint, contentGroup);
+    byEventId.set(event.eventId, group);
   }
-  const replayed = [...byStream.values()];
-  return replayed.sort((a, b) => a.receivedTimeMs - b.receivedTimeMs || a.sampleTimeMs - b.sampleTimeMs || a.sequence - b.sequence || a.eventId.localeCompare(b.eventId));
+
+  const conflicts = [...byEventId.entries()]
+    .filter(([, group]) => group.byContent.size > 1)
+    .map(([eventId, group]) => {
+      const variants = [...group.byContent.values()]
+        .map((contentGroup) => {
+          const indexes = contentGroup.reports.map((report) => report.index).sort((a, b) => a - b);
+          return {
+            fingerprint: contentGroup.fingerprint,
+            indexes,
+            receivedTimeMs: contentGroup.reports.map((report) => report.event.receivedTimeMs),
+            content: contentGroup.content,
+          };
+        })
+        .sort((a, b) => compareStrings(a.fingerprint, b.fingerprint));
+      return {
+        eventId,
+        indexes: variants.flatMap((variant) => variant.indexes).sort((a, b) => a - b),
+        variants,
+      };
+    })
+    .sort((a, b) => compareStrings(a.eventId, b.eventId));
+
+  if (conflicts.length > 0) {
+    throw new DomainError(
+      'EVENT_ID_CONFLICT',
+      `Conflicting telemetry reports share eventId(s): ${conflicts.map((conflict) => conflict.eventId).join(', ')}`,
+      422,
+      {
+        eventId: conflicts[0].eventId,
+        indexes: conflicts[0].indexes,
+        conflicts,
+      },
+    );
+  }
+
+  return [...byEventId.values()]
+    .map((group) => {
+      const reports = [...group.byContent.values()][0].reports;
+      return reports.reduce((latest, report) => {
+        if (report.event.receivedTimeMs > latest.event.receivedTimeMs
+          || (report.event.receivedTimeMs === latest.event.receivedTimeMs && report.index < latest.index)) {
+          return report;
+        }
+        return latest;
+      }).event;
+    })
+    .sort(compareByPhysicalTime);
+}
+
+export function replayTelemetry(input: TelemetryEvent[]): TelemetryEvent[] {
+  return canonicalizeTelemetry(input);
 }
 
 export function indexBySampleTime(events: TelemetryEvent[]): Map<number, TelemetryEvent[]> {
   const index = new Map<number, TelemetryEvent[]>();
-  for (const event of replayTelemetry(events)) index.set(event.sampleTimeMs, [...(index.get(event.sampleTimeMs) ?? []), event]);
+  for (const event of canonicalizeTelemetry(events)) {
+    index.set(event.sampleTimeMs, [...(index.get(event.sampleTimeMs) ?? []), event]);
+  }
   return index;
 }
